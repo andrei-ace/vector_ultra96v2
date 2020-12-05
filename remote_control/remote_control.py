@@ -41,9 +41,25 @@ try:
 except ImportError:
     sys.exit("Cannot import from PIL: Do `pip3 install --user Pillow` to install")
 
+
 import numpy as np
 from pynq_dpu import DpuOverlay
 from pynq_dpu.edge.dnndk.tf_yolov3_voc_py.tf_yolov3_voc import *
+
+
+KERNEL_CONV="tf_yolov3"
+CONV_INPUT_NODE="conv2d_1_convolution"
+CONV_OUTPUT_NODE1="conv2d_59_convolution"
+CONV_OUTPUT_NODE2="conv2d_67_convolution"
+CONV_OUTPUT_NODE3="conv2d_75_convolution"
+
+overlay = DpuOverlay("dpu.bit")
+overlay.load_model("./lib/dpu_tf_yolov3.elf")
+
+n2cube.dpuOpen()
+kernel = n2cube.dpuLoadKernel(KERNEL_CONV)
+task = n2cube.dpuCreateTask(kernel, 0)
+
 
 def create_default_image(image_width, image_height, do_gradient=False):
     """Create a place-holder PIL image to use until we have a live feed from Vector"""
@@ -85,24 +101,123 @@ class DebugAnnotations(Enum):
 # Annotator for displaying boxes around identified objects
 
 class YoloV3Display(annotate.Annotator):
-    anchor_list = [10,13,16,30,33,23,30,61,62,45,59,119,116,90,156,198,373,326]
-    anchor_float = [float(x) for x in anchor_list]
-    anchors = np.array(anchor_float).reshape(-1, 2)
-    classes_path = "./lib/voc_classes.txt"
-    class_names = get_class(classes_path)
 
     def __init__(self, img_annotator, priority=None):
         annotate.Annotator.__init__(self, img_annotator, priority)
-        overlay = DpuOverlay("dpu.bit")
-        overlay.load_model("lib/dpu_tf_yolov3.elf")
-        
+
+        anchor_list = [10,13,16,30,33,23,30,61,62,45,59,119,116,90,156,198,373,326]
+        anchor_float = [float(x) for x in anchor_list]
+        self.anchors = np.array(anchor_float).reshape(-1, 2)
+
+        classes_path = "./lib/voc_classes.txt"
+        self.class_names = get_class(classes_path)
+
+        self.num_classes = len(self.class_names)
+        hsv_tuples = [(1.0 * x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
+        self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
+        self.colors = list(map(lambda x:
+                  (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)),
+                  self.colors))
+        self.cache = None
+        self.last_time = time.time()
+
+    def evaluate(self, yolo_outputs, image_shape, class_names, anchors):
+        score_thresh = 0.2
+        anchor_mask = [[6, 7, 8], [3, 4, 5], [0, 1, 2]]
+        boxes = []
+        box_scores = []
+        input_shape = np.shape(yolo_outputs[0])[1 : 3]
+        input_shape = np.array(input_shape)*32
+
+        for i in range(len(yolo_outputs)):
+            _boxes, _box_scores = boxes_and_scores(
+                yolo_outputs[i], anchors[anchor_mask[i]], len(class_names),
+                input_shape, image_shape)
+            boxes.append(_boxes)
+            box_scores.append(_box_scores)
+        boxes = np.concatenate(boxes, axis = 0)
+        box_scores = np.concatenate(box_scores, axis = 0)
+
+        mask = box_scores >= score_thresh
+        boxes_ = []
+        scores_ = []
+        classes_ = []
+        for c in range(len(class_names)):
+            class_boxes_np = boxes[mask[:, c]]
+            class_box_scores_np = box_scores[:, c]
+            class_box_scores_np = class_box_scores_np[mask[:, c]]
+            nms_index_np = nms_boxes(class_boxes_np, class_box_scores_np)
+            class_boxes_np = class_boxes_np[nms_index_np]
+            class_box_scores_np = class_box_scores_np[nms_index_np]
+            classes_np = np.ones_like(class_box_scores_np, dtype = np.int32) * c
+            boxes_.append(class_boxes_np)
+            scores_.append(class_box_scores_np)
+            classes_.append(classes_np)
+        boxes_ = np.concatenate(boxes_, axis = 0)
+        scores_ = np.concatenate(scores_, axis = 0)
+        classes_ = np.concatenate(classes_, axis = 0)
+
+        return boxes_, scores_, classes_
+
+
+    def inference(self, image, scale):
+
+        if self.cache and time.time() - self.last_time < 1:
+           return self.cache
+
+        self.last_time = time.time()
+        image = cv2.cvtColor(np.asarray(image),cv2.COLOR_RGB2BGR)
+        image_size = image.shape[:2]
+        image_data = np.array(pre_process(image, (416, 416)), dtype=np.float32)
+
+        input_len = n2cube.dpuGetInputTensorSize(task, CONV_INPUT_NODE)
+        n2cube.dpuSetInputTensorInHWCFP32(
+            task, CONV_INPUT_NODE, image_data, input_len)
+
+        n2cube.dpuRunTask(task)
+
+        conv_sbbox_size = n2cube.dpuGetOutputTensorSize(task, CONV_OUTPUT_NODE1)
+        conv_out1 = n2cube.dpuGetOutputTensorInHWCFP32(task, CONV_OUTPUT_NODE1,
+                                               conv_sbbox_size)
+        conv_out1 = np.reshape(conv_out1, (1, 13, 13, 75))
+
+        conv_mbbox_size = n2cube.dpuGetOutputTensorSize(task, CONV_OUTPUT_NODE2)
+        conv_out2 = n2cube.dpuGetOutputTensorInHWCFP32(task, CONV_OUTPUT_NODE2,
+                                               conv_mbbox_size)
+        conv_out2 = np.reshape(conv_out2, (1, 26, 26, 75))
+
+        conv_lbbox_size = n2cube.dpuGetOutputTensorSize(task, CONV_OUTPUT_NODE3)
+        conv_out3 = n2cube.dpuGetOutputTensorInHWCFP32(task, CONV_OUTPUT_NODE3,
+                                               conv_lbbox_size)
+        conv_out3 = np.reshape(conv_out3, (1, 52, 52, 75))
+
+        yolo_outputs = [conv_out1, conv_out2, conv_out3]
+
+        boxes, scores, classes = self.evaluate(yolo_outputs, image_size,
+                                  self.class_names, self.anchors)
+
+        self.cache = boxes, scores, classes
+        return self.cache
+
     def apply(self, image, scale):
         d = ImageDraw.Draw(image)
-        bounds = ImageRect(image.width/2-10, image.height/2-10, 20, 20)
-        text = annotate.ImageText(time.strftime("%H:%m:%S"),
-                              position=annotate.AnnotationPosition.TOP_LEFT,
-                              outline_color="black")
-        annotate.add_img_box_to_image(d, bounds, 'green', text)
+
+        boxes, scores, classes = self.inference(image, scale)
+
+        for i,bbox in enumerate(boxes):
+            [top, left, bottom, right] = bbox
+            width, height = right - left, bottom - top
+            center_x, center_y = left + width*0.5, top + height*0.5
+            score, class_index = scores[i], classes[i]
+            if score < 0.5:
+               continue
+            label = '{}: {:.2f}'.format(self.class_names[class_index], score)
+            color = self.colors[class_index]
+            bounds = ImageRect(left, top, width, height)
+            text = annotate.ImageText(label,
+                               position=annotate.AnnotationPosition.TOP_LEFT,
+                               outline_color='red')
+            annotate.add_img_box_to_image(d, bounds, color, text)
 
 
 # Annotator for displaying RobotState (position, etc.) on top of the camera feed
@@ -833,25 +948,25 @@ def handle_updateVector():
 def run():
     args = util.parse_command_args()
 
-    with anki_vector.AsyncRobot(args.serial, enable_face_detection=True, enable_custom_object_detection=True) as robot:
+    with anki_vector.AsyncRobot(args.serial, enable_face_detection=False, enable_custom_object_detection=False) as robot:
         flask_app.remote_control_vector = RemoteControlVector(robot)
         flask_app.display_debug_annotations = DebugAnnotations.ENABLED_ALL.value
 
         robot.camera.init_camera_feed()
-        robot.behavior.drive_off_charger()
-        robot.camera.image_annotator.add_annotator('yoloV3', YoloV3Display)
+        # robot.behavior.drive_off_charger()
+        robot.camera.image_annotator.add_annotator('yolov3', YoloV3Display)
         robot.camera.image_annotator.disable_annotator('objects')
         robot.camera.image_annotator.disable_annotator('faces')
 
-
         flask_helpers.run_flask(flask_app,host_ip="0.0.0.0", host_port=5000, enable_flask_logging=False,
                 open_page=False, open_page_delay=1.0)
-
 
 if __name__ == '__main__':
     try:
         run()
     except KeyboardInterrupt as e:
-        pass
+        n2cube.dpuDestroyTask(task)
+        n2cube.dpuDestroyKernel(kernel)
+        n2cube.dpuClose()
     except anki_vector.exceptions.VectorConnectionException as e:
         sys.exit("A connection error occurred: %s" % e)
