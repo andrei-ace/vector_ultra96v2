@@ -29,6 +29,7 @@ from lib import flask_helpers
 import anki_vector
 from anki_vector import util
 from anki_vector import annotate
+from anki_vector.util import ImageRect
 
 try:
     from flask import Flask, request
@@ -40,6 +41,9 @@ try:
 except ImportError:
     sys.exit("Cannot import from PIL: Do `pip3 install --user Pillow` to install")
 
+import numpy as np
+from pynq_dpu import DpuOverlay
+from pynq_dpu.edge.dnndk.tf_yolov3_voc_py.tf_yolov3_voc import *
 
 def create_default_image(image_width, image_height, do_gradient=False):
     """Create a place-holder PIL image to use until we have a live feed from Vector"""
@@ -78,9 +82,32 @@ class DebugAnnotations(Enum):
     ENABLED_VISION = 1
     ENABLED_ALL = 2
 
+# Annotator for displaying boxes around identified objects
+
+class YoloV3Display(annotate.Annotator):
+    anchor_list = [10,13,16,30,33,23,30,61,62,45,59,119,116,90,156,198,373,326]
+    anchor_float = [float(x) for x in anchor_list]
+    anchors = np.array(anchor_float).reshape(-1, 2)
+    classes_path = "./lib/voc_classes.txt"
+    class_names = get_class(classes_path)
+
+    def __init__(self, img_annotator, priority=None):
+        annotate.Annotator.__init__(self, img_annotator, priority)
+        overlay = DpuOverlay("dpu.bit")
+        overlay.load_model("lib/dpu_tf_yolov3.elf")
+        
+    def apply(self, image, scale):
+        d = ImageDraw.Draw(image)
+        bounds = ImageRect(image.width/2-10, image.height/2-10, 20, 20)
+        text = annotate.ImageText(time.strftime("%H:%m:%S"),
+                              position=annotate.AnnotationPosition.TOP_LEFT,
+                              outline_color="black")
+        annotate.add_img_box_to_image(d, bounds, 'green', text)
+
 
 # Annotator for displaying RobotState (position, etc.) on top of the camera feed
 class RobotStateDisplay(annotate.Annotator):
+
     def apply(self, image, scale):
         d = ImageDraw.Draw(image)
 
@@ -653,7 +680,8 @@ def handle_index_page():
 
 def get_annotated_image():
     image = flask_app.remote_control_vector.vector.camera.latest_image
-    # here do inference 
+    if flask_app.display_debug_annotations != DebugAnnotations.DISABLED.value:
+        return image.annotate_image()
     return image.raw_image
 
 
@@ -811,10 +839,13 @@ def run():
 
         robot.camera.init_camera_feed()
         robot.behavior.drive_off_charger()
-        robot.camera.image_annotator.add_annotator('robotState', RobotStateDisplay)
+        robot.camera.image_annotator.add_annotator('yoloV3', YoloV3Display)
+        robot.camera.image_annotator.disable_annotator('objects')
+        robot.camera.image_annotator.disable_annotator('faces')
+
 
         flask_helpers.run_flask(flask_app,host_ip="0.0.0.0", host_port=5000, enable_flask_logging=False,
-        	open_page=False, open_page_delay=1.0)
+                open_page=False, open_page_delay=1.0)
 
 
 if __name__ == '__main__':
